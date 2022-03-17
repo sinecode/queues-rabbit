@@ -142,24 +142,24 @@ module Queues
         #
         # @return [FalseClass] if errors
         #
-        def batch_subscribe(batch_size:, batch_timeout:)
+        def batch_subscribe(batch_size:, batch_timeout: nil)
           raise StandardError.new('Batch size must be a positive integer') if batch_size.to_i <= 0
           raise StandardError.new("Batch size must be less or equal than prefetch: got batch_size=#{batch_size} and prefetch=#{prefetch}") if batch_size > prefetch
+          raise StandardError.new('Batch timeout must be a positive integer') if batch_timeout && batch_timeout < 0
 
           logger.info "Subscribing to queue #{name} with a batch size #{batch_size}"
           consumer = new
           batch = []
+          last_message_time = Time.now
+          lock = Mutex.new
           # Batched subscribe must be performed only by one thread
           # Auto-acking is done manually, otherwise batching is not possible
           queue_instance.subscribe(worker_threads: 1, no_ack: false, prefetch: prefetch) do |message|
-            if message.properties.type == 'timeout'
-              message.ack  # Remove the timeout message from the queue
-              min_batch_size = 0
-            else
+            lock.synchronize do
+              last_message_time = Time.now
               batch << Queues::Rabbit::Message.new(message)
-              min_batch_size = batch_size
-            end
-            if batch.size > 0 && batch.size >= min_batch_size
+              next if batch.size < batch_size
+
               batch.each(&:ack) if no_ack
               consumer.batch_consume(batch)
               batch = []
@@ -170,10 +170,23 @@ module Queues
           end
 
           loop do
-            logger.stdout "Connection to #{name} alive."
-            sleep batch_timeout
-            queue_instance.publish('', type: 'timeout', persistent: false, espiration: 3.seconds)
+            logger.stdout "Connection to #{name} aliveeeee."
+            sleep [10, batch_timeout].min
+            next if batch_timeout.nil?
+
+            lock.synchronize do
+              if (Time.now - last_message_time) > batch_timeout
+                last_message_time = Time.now
+                if batch.size > 0
+                  batch.each(&:ack) if no_ack
+                  consumer.batch_consume(batch)
+                  batch = []
+                end
+              end
+            end
           end
+        rescue Interrupt
+          raise  # Do not rescue interrupts because they are an expected way to kill a subscribe runner
         rescue Exception => e
           logger.error_with_report "Unable to connect to #{name}: #{e.message}."
           false
